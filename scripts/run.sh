@@ -3,7 +3,7 @@
 set -e
 
 echo "Building project..."
-cargo build
+cargo build --workspace --release
 
 echo "Running supervisor..."
 cargo run --bin supervisor

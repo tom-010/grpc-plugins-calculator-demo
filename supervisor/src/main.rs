@@ -1,21 +1,22 @@
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::process::Command;
 use tokio::time::{sleep, Duration};
 
 // This is a Unix-specific extension for pre_exec.
 #[cfg(unix)]
 use rlimit::{setrlimit, Resource};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 pub mod calculator {
     tonic::include_proto!("calculator");
 }
 
+const MB: u64 = 1024 * 1024;
+
 /// Manages a single plugin subprocess, restarting it with backoff on failure.
 async fn plugin_manager_task(plugin_path: PathBuf, socket_path: PathBuf) {
     let plugin_name = plugin_path.file_name().unwrap().to_str().unwrap();
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = Duration::from_secs(100);
     const MAX_BACKOFF: Duration = Duration::from_secs(60);
 
     loop {
@@ -27,8 +28,8 @@ async fn plugin_manager_task(plugin_path: PathBuf, socket_path: PathBuf) {
         #[cfg(unix)]
         unsafe {
             cmd.pre_exec(|| {
-                // Set a 256MB memory limit.
-                setrlimit(Resource::AS, 256 * 1024 * 1024, 256 * 1024 * 1024)?;
+                // Set a 32 MB memory limit.
+                setrlimit(Resource::AS, 16 * MB, 32 * MB)?;
                 Ok(())
             });
         }
@@ -120,6 +121,8 @@ async fn main() {
     let plugins_to_run = ["adder", "subtract", "divide", "multiply", "modulo"];
     let mut plugin_handles = Vec::new();
 
+    let loading_start = Instant::now();
+
     for name in plugins_to_run {
         // This relies on `cargo build` placing the binaries in a predictable location.
         if let Ok(plugin_path) = std::fs::canonicalize(format!("./target/debug/{}", name)) {
@@ -130,12 +133,42 @@ async fn main() {
         }
     }
 
+    let loading_duration = loading_start.elapsed();
+    println!("\n[supervisor] All plugin managers started in {:?}\n", loading_duration);
+
     if plugin_handles.is_empty() {
         eprintln!("No plugins found. Did you run `cargo build` first?");
         return;
     }
 
-    println!("\n[supervisor] All plugin managers started. Now testing plugins...\n");
+    let startup_start = Instant::now();
+    println!("\n[supervisor] All plugin managers started. Waiting for plugins to become available...\n");
+    
+    // Wait for all plugins to become available by testing them
+    let mut plugins_ready = std::collections::HashSet::new();
+    while plugins_ready.len() < plugins_to_run.len() {
+        for &plugin_name in &plugins_to_run {
+            if !plugins_ready.contains(plugin_name) {
+                // Try to make a quick test call to see if plugin is ready
+                match make_plugin_call_with_retry(runtime_dir, plugin_name, 1.0, 1.0).await {
+                    Ok(_) => {
+                        println!("[supervisor] Plugin '{}' is ready", plugin_name);
+                        plugins_ready.insert(plugin_name);
+                    }
+                    Err(_) => {
+                        // Plugin not ready yet, continue waiting
+                    }
+                }
+            }
+        }
+        if plugins_ready.len() < plugins_to_run.len() {
+            sleep(Duration::from_millis(50)).await;
+        }
+    }
+    
+    let startup_duration = startup_start.elapsed();
+    println!("\n[supervisor] All {} plugins started and ready in {:?}\n", plugins_to_run.len(), startup_duration);
+    println!("[supervisor] Now beginning continuous testing...\n");
 
     // Main loop to periodically test the running plugins.
     let mut plugin_index = 0;
@@ -158,8 +191,37 @@ async fn main() {
         // Attempt the call with exponential backoff retry
         match make_plugin_call_with_retry(runtime_dir, plugin_name, a, b).await {
             Ok(result) => {
+                // Assert that the result is mathematically correct
+                let expected = match plugin_name {
+                    "adder" => a + b,
+                    "subtract" => a - b,
+                    "divide" => {
+                        if b != 0.0 { a / b } else { 
+                            // For division by zero, just skip the assertion
+                            println!("[supervisor-test] Division by zero detected, skipping assertion");
+                            result
+                        }
+                    },
+                    "multiply" => a * b,
+                    "modulo" => a % b,
+                    _ => {
+                        eprintln!("[supervisor-test] Unknown plugin: {}", plugin_name);
+                        result
+                    }
+                };
+                
+                // Use epsilon comparison for floating point numbers
+                let epsilon = 1e-10;
+                if plugin_name != "divide" || b != 0.0 {
+                    assert!(
+                        (result - expected).abs() < epsilon,
+                        "Plugin {} returned incorrect result: expected {}, got {} (inputs: {} {} {})",
+                        plugin_name, expected, result, a, operation_symbol, b
+                    );
+                }
+                
                 println!(
-                    "[supervisor-test] SUCCESS: {} {} {} = {} ({})",
+                    "[supervisor-test] SUCCESS: {} {} {} = {} ({}) - VERIFIED",
                     a, operation_symbol, b, result, plugin_name
                 );
             }
