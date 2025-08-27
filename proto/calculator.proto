@@ -1,0 +1,20 @@
+syntax = "proto3";
+
+package calculator;
+
+// The service definition.
+service Calculator {
+  // A simple RPC to perform a calculation
+  rpc Calculate (CalculationRequest) returns (CalculationResponse);
+}
+
+// The request message
+message CalculationRequest {
+  double a = 1;
+  double b = 2;
+}
+
+// The response message
+message CalculationResponse {
+  double result = 1;
+}

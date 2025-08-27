@@ -1,6 +1,13 @@
-[package]
-name = "grpc-plugins-calculator-demo"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "2"
+members = [
+  "supervisor",
+  "plugins/adder",
+  "plugins/subtract",
+  "plugins/divide",
+  "plugins/multiply",
+  "plugins/modulo",
+]
 
-[dependencies]
+# Default members to run with `cargo run`
+default-members = ["supervisor"]
